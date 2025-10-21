@@ -127,6 +127,82 @@ class LssSeqLineTransformer(BaseModule):
 
 
 @MODELS.register_module()
+class LssSARPrmSeqLineTransformer(BaseModule):
+    """Semi-AR transformer that supports external block-causal tgt_mask and
+    prompt cross-attention.
+
+    This combines the mask handling style of LssPlBzTransformer (external mask)
+    with the prompt interfaces in PlPry decoder layers.
+    """
+
+    def __init__(self, encoder=None, decoder=None, init_cfg=None, cross=False):
+        super(LssSARPrmSeqLineTransformer, self).__init__(init_cfg=init_cfg)
+        if encoder is not None:
+            self.encoder = build_transformer_layer_sequence(encoder)
+        else:
+            self.encoder = None
+        self.decoder = build_transformer_layer_sequence(decoder)
+        self.embed_dims = self.decoder.embed_dims
+        self.cross = cross
+
+    def init_weights(self):
+        for m in self.modules():
+            if hasattr(m, 'weight') and m.weight.dim() > 1:
+                xavier_init(m, distribution='uniform')
+        self._is_init = True
+
+    def forward(self, tgt, x, tgt_mask, mask, query_embed, pos_embed, prompt=None, prompt_pos=None):
+        """Forward.
+
+        Args:
+            tgt (Tensor): [B, T, D]
+            x (Tensor): [B, C, H, W]
+            tgt_mask (Tensor): [T, T] block-causal mask. If [B, T, T] is given, the first sample will be used.
+            mask (Tensor): [B, H, W] key padding mask for BEV.
+            query_embed (Tensor): [T_max, D]
+            pos_embed (Tensor): [B, C, H, W]
+            prompt (Tensor, optional): [B, K, D]
+            prompt_pos (Tensor, optional): [B, K, D]
+        Returns:
+            out_dec (Tensor): [L, B, T, D]
+            memory (Tensor): not used downstream
+        """
+        bs, c, h, w = x.shape
+        # flatten encoder memory
+        memory = x.flatten(2).permute(2, 0, 1)  # [N, B, D]
+        key_pos = pos_embed.flatten(2).permute(2, 0, 1)  # [N, B, D]
+        key_padding_mask = mask.flatten(1)  # [B, N]
+
+        # [B, T, D] -> [T, B, D]
+        tgt = tgt.transpose(0, 1)
+        query_pos = query_embed.unsqueeze(1).repeat(1, bs, 1)[: len(tgt)]  # [T, B, D]
+
+        # normalize tgt_mask to [T, T]
+        if tgt_mask is None:
+            attn_mask = generate_square_subsequent_mask(len(tgt)).to(tgt.device)
+        else:
+            # Accept [T, T], [B, T, T], or [B*num_heads, T, T].
+            # Do NOT squeeze batch dimension here; downstream attention will normalize.
+            attn_mask = tgt_mask
+        
+        # decoder returns [L, T, B, D]
+        out_dec = self.decoder(
+            query=tgt,
+            key=memory,
+            value=memory,
+            prompt=prompt,
+            key_pos=key_pos,
+            query_pos=query_pos,
+            prompt_pos=prompt_pos,
+            key_padding_mask=key_padding_mask,
+            attn_masks=[attn_mask, None],
+        )
+        # [L, T, B, D] -> [L, B, T, D]
+        out_dec = out_dec.transpose(1, 2)
+        return out_dec, memory
+
+
+@MODELS.register_module()
 class LssSeqLineFlashTransformer(BaseModule):
     """Implements the DETR transformer.
     Following the official DETR implementation, this module copy-paste
@@ -264,6 +340,7 @@ class LssPlPrySeqLineTransformer(BaseModule):
                 - memory: Output results from encoder, with shape \
                       [bs, embed_dims, h, w].
         """
+        bs, s, n, c = tgt.shape
         bs, c, h, w = x.shape
 
         memory = x.flatten(2).permute(2, 0, 1)  # [40000, 2, 256]
@@ -273,8 +350,10 @@ class LssPlPrySeqLineTransformer(BaseModule):
         # memory = x.permute(1, 3, 4, 0, 2).reshape(-1, bs, c) # [bs, n, c, h, w] -> [n*h*w, bs, c]
         # pos_embed = pos_embed.permute(1, 3, 4, 0, 2).reshape(-1, bs, c) # [bs, n, c, h, w] -> [n*h*w, bs, c]
         # mask = mask.view(bs, -1)  # [bs, n, h, w] -> [bs, n*h*w]
-        # tgt = tgt.transpose(0, 1)  # [301, 1, 256]
         tgt_mask = generate_square_subsequent_mask(tgt.shape[2]).to(tgt.device)
+        tgt = tgt.squeeze(1)  # [B, 1, T, D] -> [B, T, D]
+        tgt = tgt.transpose(0, 1)  # [B, T, D] -> [T, B, D]
+        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)[:len(tgt)]  # [num_query, D] -> [T, B, D]
 
         # out_dec: [num_layers, num_query, bs, dim]
         out_dec = self.decoder(
@@ -288,6 +367,7 @@ class LssPlPrySeqLineTransformer(BaseModule):
             key_padding_mask=mask,
             attn_masks=tgt_mask
             )
+        out_dec = out_dec.transpose(1, 2)  # [num_layers, T, B, D] -> [num_layers, B, T, D]
         return out_dec, memory
 
 
@@ -432,7 +512,7 @@ class LssMLMPlPrySeqLineTransformer(BaseModule):
                 - memory: Output results from encoder, with shape \
                       [bs, embed_dims, h, w].
         """
-        bs, s, n, c =tgt.shape
+        bs, s, n, c = tgt.shape
         bs, c, h, w = x.shape
 
         memory = x.flatten(2).permute(2, 0, 1)  # [6144, 2, 256]
@@ -442,8 +522,10 @@ class LssMLMPlPrySeqLineTransformer(BaseModule):
         # memory = x.permute(1, 3, 4, 0, 2).reshape(-1, bs, c) # [bs, n, c, h, w] -> [n*h*w, bs, c]
         # pos_embed = pos_embed.permute(1, 3, 4, 0, 2).reshape(-1, bs, c) # [bs, n, c, h, w] -> [n*h*w, bs, c]
         # mask = mask.view(bs, -1)  # [bs, n, h, w] -> [bs, n*h*w]
-        # tgt = tgt.transpose(0, 1)  # [301, 1, 256]
         tgt_mask = torch.zeros(tgt.shape[2], tgt.shape[2]).to(tgt.device)
+        tgt = tgt.squeeze(1)  # [B, 1, T, D] -> [B, T, D]
+        tgt = tgt.transpose(0, 1)  # [B, T, D] -> [T, B, D]
+        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)[:len(tgt)]  # [num_query, D] -> [T, B, D]
 
         # out_dec: [num_layers, num_query, bs, dim]
         out_dec = self.decoder(
@@ -457,6 +539,7 @@ class LssMLMPlPrySeqLineTransformer(BaseModule):
             key_padding_mask=mask,
             attn_masks=tgt_mask
             )
+        out_dec = out_dec.transpose(1, 2)  # [num_layers, T, B, D] -> [num_layers, B, T, D]
         # memory = memory.reshape(n, h, w, bs, c).permute(3, 0, 4, 1, 2)
         return out_dec, memory
     
@@ -1103,6 +1186,15 @@ class RNTR2MultiheadAttention(BaseModule):
             if self.batch_first is False, else
             [bs, num_queries embed_dims].
         """
+        # ---------------- SAR FLOW DEBUG (MHA entry) ----------------
+        try:
+            if self.training and attn_mask is not None:
+                mask_shape = tuple(attn_mask.shape) if isinstance(attn_mask, torch.Tensor) else None
+                q_shape = tuple(query.shape)
+                print(f"[SAR FLOW] MHA entry: attn_mask.shape={mask_shape}, query.shape={q_shape}")
+        except Exception:
+            pass
+        # ------------------------------------------------------------
 
         if key is None:
             key = query
@@ -1133,10 +1225,57 @@ class RNTR2MultiheadAttention(BaseModule):
             query = query.transpose(0, 1)
             key = key.transpose(0, 1)
             value = value.transpose(0, 1)
-        if attn_mask == None:
-            is_causal = False
-        else:
-            is_causal = True
+
+        # Normalize attn_mask to shapes accepted by nn.MultiheadAttention.
+        # Supports: [T, T], [B, T, T], or [B*num_heads, T, T].
+        if attn_mask is not None:
+            if attn_mask.dim() == 3:
+                # query/key are [T, B, D] here when batch_first=False
+                L = query.shape[0]
+                S = key.shape[0]
+                Bq = query.shape[1]
+                if attn_mask.shape[1:] != (L, S):
+                    try:
+                        attn_mask = attn_mask.view(attn_mask.shape[0], L, S)
+                    except Exception:
+                        warnings.warn(f'RNTR2MultiheadAttention: attn_mask shape {attn_mask.shape} not match ({L},{S}); using first slice.')
+                        attn_mask = attn_mask[0]
+                if attn_mask.dim() == 3:
+                    if attn_mask.shape[0] == Bq:
+                        # expand across heads
+                        attn_mask = attn_mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1).reshape(Bq * self.num_heads, L, S)
+                    elif attn_mask.shape[0] == self.num_heads:
+                        attn_mask = attn_mask.unsqueeze(0).repeat(Bq, 1, 1, 1).reshape(Bq * self.num_heads, L, S)
+                    elif attn_mask.shape[0] == Bq * self.num_heads:
+                        pass
+                    else:
+                        warnings.warn(f'RNTR2MultiheadAttention: unexpected attn_mask batch dim {attn_mask.shape[0]} (B={Bq}, heads={self.num_heads}); using first slice.')
+                        attn_mask = attn_mask[0]
+            elif attn_mask.dim() != 2:
+                attn_mask = None
+
+        # Use explicit attn_mask, do not apply extra causal mask here to preserve custom visibility.
+        is_causal = False
+
+        # ---------------- SAR FLOW DEBUG (MHA: final attn_mask before attn call) ----------------
+        try:
+            if self.training:
+                if attn_mask is not None and isinstance(attn_mask, torch.Tensor):
+                    L_q = query.shape[0]
+                    S_k = key.shape[0]
+                    if attn_mask.dim() == 2:
+                        allow = (attn_mask == 0).sum().item()
+                        total = int(attn_mask.numel())
+                        print(f"[SAR FLOW] MHA final: attn_mask 2D shape={tuple(attn_mask.shape)}, allow={allow}/{total}, query=[{L_q},B,D], key=[{S_k},B,D], is_causal={is_causal}")
+                    elif attn_mask.dim() == 3:
+                        print(f"[SAR FLOW] MHA final: attn_mask 3D shape={tuple(attn_mask.shape)} (expect [B*{self.num_heads}, {L_q}, {S_k}]), is_causal={is_causal}")
+                    else:
+                        print(f"[SAR FLOW] MHA final: attn_mask unexpected dim={attn_mask.dim()}, shape={tuple(attn_mask.shape)}")
+                else:
+                    print(f"[SAR FLOW] MHA final: attn_mask is None (will use no mask or default causal)")
+        except Exception as e:
+            print(f"[SAR FLOW] MHA final: debug error: {e}")
+        # ------------------------------------------------------------------------------------
 
         out = self.attn(
             query=query,
@@ -1894,7 +2033,25 @@ class PlPryLineTransformerDecoderLayer(BaseModule):
         #                 f'operation_order {self.num_attn}'
         
         for layer in self.operation_order:
-            if layer == 'subg_self_attn':
+            if layer == 'self_attn':
+                # Standard self-attention with attn_mask support (for SAR)
+                temp_key = temp_value = query
+                # Extract self-attn mask from attn_masks list (first element)
+                self_attn_mask = attn_masks[0] if (attn_masks is not None and len(attn_masks) > 0) else None
+                query = self.attentions[attn_index](
+                    query,
+                    temp_key,
+                    temp_value,
+                    identity if self.pre_norm else None,
+                    query_pos=query_pos,
+                    key_pos=query_pos,
+                    attn_mask=self_attn_mask,
+                    key_padding_mask=query_key_padding_mask,
+                    **kwargs)
+                attn_index += 1
+                identity = query
+
+            elif layer == 'subg_self_attn':
                 temp_key = temp_value = query
                 query = self.attentions[attn_index](
                     query,
@@ -1933,6 +2090,8 @@ class PlPryLineTransformerDecoderLayer(BaseModule):
                 norm_index += 1
 
             elif layer == 'cross_attn':
+                # Extract cross-attn mask from attn_masks list (second element, usually None)
+                cross_attn_mask = attn_masks[1] if (attn_masks is not None and len(attn_masks) > 1) else None
                 query = self.attentions[attn_index](
                     query,
                     key,
@@ -1942,7 +2101,7 @@ class PlPryLineTransformerDecoderLayer(BaseModule):
                     query_pos=query_pos,
                     key_pos=key_pos,
                     prompt_pos=prompt_pos,
-                    attn_mask=None,
+                    attn_mask=cross_attn_mask,
                     key_padding_mask=key_padding_mask,
                     **kwargs)
                 attn_index += 1
